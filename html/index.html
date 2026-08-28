@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head><link rel="stylesheet" href="style.css"></head>
+<body>
+<div id="hud">
+<div class="card">
+<h2>Shisha</h2>
+<p>Level: <span id="level">1</span></p>
+<div class="bar"><div id="xpbar"></div></div>
+</div>
+</div>
+
+<div id="menu" style="display: none;">
+<div class="menu-card">
+<h2>Shisha-Menü</h2>
+<div id="drinks"></div>
+<div id="trays"></div>
+<div id="coal"></div>
+<div id="mixes"></div>
+<div id="flavors"></div>
+<button id="closeMenu">Schließen</button>
+</div>
+</div>
+
+<div id="adminMenu" style="display: none;">
+<div class="menu-card">
+<h2>Shisha Admin</h2>
+<div id="adminContent"></div>
+<button id="closeAdminMenu">Schließen</button>
+</div>
+</div>
+
+<div id="bossMenu" style="display: none;">
+<div class="menu-card">
+<h2>Boss-Verwaltung</h2>
+<div id="bossContent">
+<div class="boss-section">
+<h3>Konfiguration</h3>
+<label>Job erforderlich: <input type="checkbox" id="jobRequired"></label>
+<label>Job-Name: <input type="text" id="jobName" placeholder="Job-Name"></label>
+<label>Mindest-Grade: <input type="number" id="jobGrade" min="0" max="5"></label>
+<button onclick="updateBossConfig()">Speichern</button>
+</div>
+<div class="boss-section">
+<h3>Serverzeit</h3>
+<label>Stunde: <input type="number" id="serverHour" min="0" max="23"></label>
+<label>Minute: <input type="number" id="serverMinute" min="0" max="59"></label>
+<button onclick="updateServerTime()">Serverzeit setzen</button>
+</div>
+<div class="boss-section">
+<h3>Preise ändern</h3>
+<div id="tablePriceList"></div>
+<label>Neuer Preis für alle Tische: <input type="number" id="allTablePrice" min="0"></label>
+<button onclick="setAllTablePrices()">Alle Tischpreise setzen</button>
+</div>
+<div class="boss-section">
+<h3>Getränke-Preise</h3>
+<div id="drinkPriceList"></div>
+</div>
+<div class="boss-section">
+<h3>Tablett-Preise</h3>
+<div id="trayPriceList"></div>
+</div>
+<div class="boss-section">
+<h3>Kohle-Preis</h3>
+<label>Kohle-Preis: <input type="number" id="coalPrice" min="0"></label>
+<button onclick="updateCoalPrice()">Preis aktualisieren</button>
+</div>
+<div class="boss-section">
+<h3>Tastenbelegung</h3>
+<label>Menü öffnen: <input type="number" id="keyMenu" min="0"></label>
+<label>Boss-Menü: <input type="number" id="keyBossMenu" min="0"></label>
+<label>Boss Modifier: <input type="number" id="keyBossModifier" min="0"></label>
+<label>HUD umschalten: <input type="number" id="keyToggleHUD" min="0"></label>
+<label>Rauchen: <input type="number" id="keySmoke" min="0"></label>
+<button onclick="updateBossKeyBindings()">Tasten speichern</button>
+</div>
+<div class="boss-section">
+<h3>Statistiken</h3>
+<div id="statsContent">
+<p>Lade Statistiken...</p>
+</div>
+<button onclick="loadStats()">Aktualisieren</button>
+</div>
+    </div>
+    <button id="closeBossMenu">Schließen</button>
+    </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
