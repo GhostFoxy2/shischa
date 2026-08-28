@@ -5,9 +5,10 @@ local HUDVisible = Config.HUD.visible
 local PlayerJob = nil
 local PlayerGrade = 0
 local TableOccupancy = {}
-local HasCoal = false
 local SmokingActive = false
 local SmokeCount = 0
+local CurrentTableId = nil
+local TargetZones = {}
 
 -- Registriere Keybinds (im Spiel änderbar)
 RegisterKeyMapping('shisha:order', Config.Keybinds.order.label, 'keyboard', Config.Keybinds.order.key)
@@ -31,16 +32,23 @@ local function Notify(data)
     })
 end
 
--- Job updaten
+local function UpdatePlayerJob(job)
+    if not job then return end
+    PlayerJob = job.name
+    PlayerGrade = tonumber(job.grade) or 0
+end
+
 CreateThread(function()
-    while true do
-        local playerData = ESX.PlayerData
-        if playerData and playerData.job then
-            PlayerJob = playerData.job.name
-            PlayerGrade = playerData.job.grade or 0
-        end
-        Wait(1000)
-    end
+    while not ESX.PlayerData or not ESX.PlayerData.job do Wait(250) end
+    UpdatePlayerJob(ESX.PlayerData.job)
+end)
+
+RegisterNetEvent('esx:setJob', function(job)
+    UpdatePlayerJob(job)
+end)
+
+RegisterNetEvent('esx:playerLoaded', function(playerData)
+    if playerData then UpdatePlayerJob(playerData.job) end
 end)
 
 -- Prüfe ob Job erlaubt ist
@@ -139,13 +147,14 @@ function IsItemAvailableForJob(itemName, itemType)
 end
 
 CreateThread(function()
-    for i, table in pairs(Config.Tables) do
-        exports.ox_target:addBoxZone({
-            coords = table.coords,
+    for i, tableConfig in pairs(Config.Tables) do
+        local tableId = i
+        local zoneId = exports.ox_target:addBoxZone({
+            coords = tableConfig.coords,
             size = vec3(1.5,1.5,2.0),
             options = {
                 {
-                    label = 'Shisha bestellen (' .. table.label .. ')',
+                    label = 'Shisha bestellen (' .. tableConfig.label .. ')',
                     icon = "fa-smoking",
                     onSelect = function()
                         if not IsJobAllowed() then
@@ -156,7 +165,7 @@ CreateThread(function()
                             })
                             return
                         end
-                        TriggerServerEvent('shisha:order', i)
+                        TriggerServerEvent('shisha:order', tableId)
                     end
                 },
                 {
@@ -176,6 +185,7 @@ CreateThread(function()
                 }
             }
         })
+        TargetZones[#TargetZones + 1] = zoneId
     end
 
     -- HUD-Konfiguration senden, falls aktiviert
@@ -203,52 +213,17 @@ function ToggleHUD()
 end
 
 function OpenShishaMenu()
-    -- Berechne effektive Preise mit Job-Rabatten
-    local effectiveDrinks = {}
-    for name, data in pairs(Config.Drinks) do
-        effectiveDrinks[name] = {
-            price = GetEffectivePrice(data.price, "drinks"),
-            originalPrice = data.price
-        }
-    end
-
-    local effectiveTrays = {}
-    for name, data in pairs(Config.Trays) do
-        if IsItemAvailableForJob(name, "tray") then
-            effectiveTrays[name] = {
-                price = GetEffectivePrice(data.price, "drinks"),  -- Tabletts nutzen Getränke-Rabatt
-                originalPrice = data.price,
-                description = data.description,
-                effect = data.effect,
-                xp = data.xp
-            }
-        end
-    end
-
-    local effectiveMixes = {}
-    for name, data in pairs(Config.AlcoholMixes) do
-        if IsItemAvailableForJob(name, "mix") then
-            effectiveMixes[name] = {
-                price = GetEffectivePrice(data.price, "drinks"),  -- Mixe nutzen Getränke-Rabatt
-                originalPrice = data.price,
-                description = data.description,
-                effect = data.effect,
-                xp = data.xp
-            }
-        end
-    end
+    local menuData = lib.callback.await('shisha:getMenuData', false)
+    if not menuData then return end
 
     SendNUIMessage({
         action = "openMenu",
-        drinks = effectiveDrinks,
-        trays = effectiveTrays,
-        mixes = effectiveMixes,
-        coal = Config.Coal,
-        flavors = Config.Flavors,
-        jobDiscounts = {
-            drinks = GetJobDiscount("drinks"),
-            tables = GetJobDiscount("tables")
-        }
+        drinks = menuData.drinks or {},
+        trays = menuData.trays or {},
+        mixes = menuData.mixes or {},
+        coal = menuData.coal or {},
+        flavors = menuData.flavors or {},
+        jobDiscounts = menuData.jobDiscounts or {}
     })
     SetNuiFocus(true, true)
 end
@@ -409,65 +384,57 @@ RegisterCommand('boss', function(source, args, rawCommand)
     TriggerServerEvent('shisha:openBossMenu')
 end)
 
-RegisterNetEvent('shisha:startSession', function(tableId)
+local function ResetSmokingState(clearTasks)
+    SmokingActive = false
+    SmokeCount = 0
+    CurrentTableId = nil
+    if clearTasks then ClearPedTasks(PlayerPedId()) end
+end
+
+RegisterNetEvent('shisha:startSession', function(tableId, canSmoke)
     local ped = PlayerPedId()
-    local table = Config.Tables[tableId]
-    local seat = table.seats[1]
+    local tableConfig = Config.Tables[tonumber(tableId)]
+    if not tableConfig or not tableConfig.seats or not tableConfig.seats[1] then return end
+    local seat = tableConfig.seats[1]
 
     SetEntityCoords(ped, seat.x, seat.y, seat.z)
     SetEntityHeading(ped, seat.w)
-
     TaskStartScenarioAtPosition(ped, "PROP_HUMAN_SEAT_CHAIR", seat.x, seat.y, seat.z-1.0, seat.w, 0, true, true)
 
-    -- Starte manuelles Rauchen
-    StartManualSmoking(ped)
+    CurrentTableId = tonumber(tableId)
+    SmokingActive = canSmoke == true
+    SmokeCount = 0
 end)
 
-function StartManualSmoking(ped)
-    if not HasCoal then
-        Notify({
-            title = 'Shisha',
-            description = 'Du brauchst zuerst Shisha-Kohle!',
-            type = 'error'
-        })
-        return
-    end
-
-    HasCoal = false
+RegisterNetEvent('shisha:coalReady', function()
+    if not CurrentTableId then return end
     SmokingActive = true
     SmokeCount = 0
-    CreateThread(function()
-        while SmokingActive and SmokeCount < 5 do
-            Wait(0)
-        end
-    end)
-end
+    Notify({title = 'Shisha', description = 'Kohle ist bereit. Du kannst jetzt rauchen.', type = 'success'})
+end)
 
 RegisterCommand('shisha:smoke', function()
     if not SmokingActive then
+        Notify({title = 'Shisha', description = 'Du hast keine aktive Session mit Kohle.', type = 'error'})
         return
     end
-
-    local ped = PlayerPedId()
-    Smoke(ped)
-    TriggerServerEvent('shisha:addXP', 10)
-    SmokeCount = SmokeCount + 1
-
-    if SmokeCount >= 5 then
-        Notify({
-            title = 'Shisha',
-            description = 'Session abgeschlossen!',
-            type = 'success'
-        })
-        EndSmoking()
-    end
+    TriggerServerEvent('shisha:smoke')
 end)
 
-function EndSmoking()
-    SmokingActive = false
-    SmokeCount = 0
-    TriggerServerEvent('shisha:endSession')
-end
+RegisterNetEvent('shisha:performSmoke', function(smokeCount)
+    if not SmokingActive then return end
+    SmokeCount = tonumber(smokeCount) or SmokeCount
+    Smoke(PlayerPedId())
+end)
+
+RegisterNetEvent('shisha:sessionCompleted', function()
+    Notify({title = 'Shisha', description = 'Session abgeschlossen!', type = 'success'})
+    ResetSmokingState(true)
+end)
+
+RegisterNetEvent('shisha:sessionEnded', function()
+    ResetSmokingState(true)
+end)
 
 function Smoke(ped)
     RequestNamedPtfxAsset("core")
@@ -645,7 +612,6 @@ RegisterNetEvent('shisha:notify', function(message, notificationType)
 end)
 
 RegisterNetEvent('shisha:addCoal', function()
-    HasCoal = true
     Notify({
         title = 'Shisha',
         description = 'Du hast Shisha-Kohle gekauft. Du kannst jetzt rauchen.',
@@ -694,14 +660,6 @@ RegisterNetEvent('shisha:setConfig', function(newConfig)
             if newConfig.HUD.position then Config.HUD.position = newConfig.HUD.position end
             if newConfig.HUD.colors then Config.HUD.colors = newConfig.HUD.colors end
             if newConfig.HUD.visible ~= nil then Config.HUD.visible = newConfig.HUD.visible end
-        end
-        if newConfig.KeyBindings and type(newConfig.KeyBindings) == 'table' then
-            Config.KeyBindings = Config.KeyBindings or {}
-            if newConfig.KeyBindings.menu ~= nil then Config.KeyBindings.menu = newConfig.KeyBindings.menu; Config.MenuKey = newConfig.KeyBindings.menu end
-            if newConfig.KeyBindings.bossMenu ~= nil then Config.KeyBindings.bossMenu = newConfig.KeyBindings.bossMenu; Config.BossMenuKey = newConfig.KeyBindings.bossMenu end
-            if newConfig.KeyBindings.bossMenuModifier ~= nil then Config.KeyBindings.bossMenuModifier = newConfig.KeyBindings.bossMenuModifier; Config.BossMenuModifier = newConfig.KeyBindings.bossMenuModifier end
-            if newConfig.KeyBindings.toggleHUD ~= nil then Config.KeyBindings.toggleHUD = newConfig.KeyBindings.toggleHUD; Config.ToggleHUDKey = newConfig.KeyBindings.toggleHUD end
-            if newConfig.KeyBindings.smoke ~= nil then Config.KeyBindings.smoke = newConfig.KeyBindings.smoke; Config.SmokeKey = newConfig.KeyBindings.smoke end
         end
     end
 end)
@@ -786,16 +744,8 @@ RegisterCommand('shisha:bossMenu', function()
         })
         return
     end
-    
-    if PlayerGrade < Config.BossMenu.bossGradeRequired then
-        Notify({
-            title = 'Shisha',
-            description = 'Du benötigst mindestens Grade ' .. Config.BossMenu.bossGradeRequired .. ' für das Boss-Menü',
-            type = 'error'
-        })
-        return
-    end
-    
+
+    -- Die endgültige Rechteprüfung erfolgt serverseitig (inklusive Admins).
     TriggerServerEvent('shisha:openBossMenu')
 end)
 
@@ -874,8 +824,13 @@ end
 
 CreateThread(function()
     while true do
-        Wait(0)
-        for tableId, table in pairs(Config.Tables) do
+        local playerCoords = GetEntityCoords(PlayerPedId())
+        local isNearAnyTable = false
+
+        for tableId, tableConfig in pairs(Config.Tables) do
+            local distance = #(playerCoords - tableConfig.coords)
+            if distance <= 30.0 then
+                isNearAnyTable = true
             local occupied = TableOccupancy[tableId]
             local colorR, colorG, colorB = 0, 255, 0
             local text = "Tisch frei"
@@ -884,9 +839,24 @@ CreateThread(function()
                 text = "Tisch belegt"
             end
 
-            DrawMarker(1, table.coords.x, table.coords.y, table.coords.z - 0.95, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 1.5, 0.5, colorR, colorG, colorB, 100, false, false, 2, false, nil, nil, false)
-            DrawText3D(table.coords.x, table.coords.y, table.coords.z + 0.8, text)
+                DrawMarker(1, tableConfig.coords.x, tableConfig.coords.y, tableConfig.coords.z - 0.95, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 1.5, 0.5, colorR, colorG, colorB, 100, false, false, 2, false, nil, nil, false)
+                DrawText3D(tableConfig.coords.x, tableConfig.coords.y, tableConfig.coords.z + 0.8, text)
+            end
         end
+
+        Wait(isNearAnyTable and 0 or 750)
     end
 end)
 
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= GetCurrentResourceName() then return end
+    SetNuiFocus(false, false)
+    ClearTimecycleModifier()
+    ShakeGameplayCam('DRUNK_SHAKE', 0.0)
+    SetRunSprintMultiplierForPlayer(PlayerId(), 1.0)
+    ClearPedTasks(PlayerPedId())
+
+    for _, zoneId in ipairs(TargetZones) do
+        exports.ox_target:removeZone(zoneId)
+    end
+end)

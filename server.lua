@@ -2,8 +2,189 @@
 
 local ESX = exports["es_extended"]:getSharedObject()
 
+local MAX_XP_CAP = 50000 -- Sicherheitsbegrenzung für XP
+local XP_PER_LEVEL = 100
 local PlayerXP = {}
 local PlayerSessions = {}
+local PlayerCoal = {}
+local RateLimits = {}
+local RuntimeStats = {
+    date = os.date('%Y-%m-%d'),
+    moneyToday = 0,
+    totalMoney = 0,
+    sessionToday = 0
+}
+
+local function Notify(src, message, notificationType)
+    TriggerClientEvent('shisha:notify', src, message, notificationType or 'inform')
+end
+
+local function IsFiniteNumber(value)
+    return type(value) == 'number' and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function NormalizePrice(value)
+    local price = tonumber(value)
+    local maxPrice = (Config.Security and Config.Security.maxPrice) or 1000000
+    if not IsFiniteNumber(price) or price < 0 or price > maxPrice then return nil end
+    return math.floor(price)
+end
+
+local function RefreshDailyStats()
+    local currentDate = os.date('%Y-%m-%d')
+    if RuntimeStats.date ~= currentDate then
+        RuntimeStats.date = currentDate
+        RuntimeStats.moneyToday = 0
+        RuntimeStats.sessionToday = 0
+    end
+end
+
+local function CountEntries(value)
+    local count = 0
+    for _ in pairs(value or {}) do count = count + 1 end
+    return count
+end
+
+-- Prüfe, ob ein Job serverseitig erlaubt ist.
+local function IsJobAllowed(jobName, jobGrade)
+    if not Config.JobRequired then return true end
+
+    local grade = tonumber(jobGrade) or 0
+    if Config.UseMultipleJobs then
+        for _, job in ipairs(Config.AllowedJobs or {}) do
+            if jobName == job[1] and grade >= (tonumber(job[2]) or 0) then
+                return true
+            end
+        end
+        return false
+    end
+
+    return jobName == Config.Job and grade >= (tonumber(Config.JobGradeRequired) or 0)
+end
+
+local function GetPlayerJob(xPlayer)
+    if not xPlayer or not xPlayer.getJob then return nil end
+    return xPlayer.getJob()
+end
+
+local function GetDiscountForPlayer(xPlayer, itemType)
+    local job = GetPlayerJob(xPlayer)
+    local discounts = Config.JobFunctions and Config.JobFunctions.discounts
+    if not job or not discounts or not discounts[itemType] then return 0 end
+
+    local grade = math.max(0, math.min(tonumber(job.grade) or 0, 5))
+    local discount = tonumber(discounts[itemType][grade]) or 0
+    return math.max(0, math.min(discount, 100))
+end
+
+local function GetEffectivePrice(xPlayer, basePrice, itemType)
+    local price = NormalizePrice(basePrice)
+    if not price then return nil end
+    local discount = GetDiscountForPlayer(xPlayer, itemType)
+    return math.floor(price * (1 - discount / 100))
+end
+
+local function IsItemAvailableForJob(xPlayer, itemName)
+    local job = GetPlayerJob(xPlayer)
+    if not job then return false end
+
+    local requiredGrade
+    for grade, items in pairs((Config.JobFunctions and Config.JobFunctions.exclusiveItems) or {}) do
+        for _, configuredName in ipairs(items) do
+            if configuredName == itemName then
+                local numericGrade = tonumber(grade) or 0
+                requiredGrade = requiredGrade and math.min(requiredGrade, numericGrade) or numericGrade
+            end
+        end
+    end
+
+    return not requiredGrade or (tonumber(job.grade) or 0) >= requiredGrade
+end
+
+local function IsPlayerNearTable(src, tableId)
+    local tableConfig = Config.Tables[tonumber(tableId)]
+    if not tableConfig then return false end
+
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return false end
+
+    local maxDistance = (Config.Security and Config.Security.interactionDistance) or 4.0
+    return #(GetEntityCoords(ped) - tableConfig.coords) <= maxDistance
+end
+
+local function IsPlayerNearAnyTable(src)
+    for tableId in ipairs(Config.Tables) do
+        if IsPlayerNearTable(src, tableId) then return true end
+    end
+    return false
+end
+
+local function CheckRateLimit(src, action, cooldownMs)
+    local now = GetGameTimer()
+    RateLimits[src] = RateLimits[src] or {}
+    local allowedAt = RateLimits[src][action] or 0
+    if now < allowedAt then return false end
+    RateLimits[src][action] = now + cooldownMs
+    return true
+end
+
+local function RecordRevenue(amount)
+    RefreshDailyStats()
+    RuntimeStats.moneyToday = RuntimeStats.moneyToday + amount
+    RuntimeStats.totalMoney = RuntimeStats.totalMoney + amount
+end
+
+local function DepositSocietyMoney(amount)
+    if amount <= 0 then return end
+    TriggerEvent('esx_addonaccount:getSharedAccount', 'society_shisha', function(account)
+        if account then account.addMoney(amount) end
+    end)
+end
+
+local function ChargePlayer(src, xPlayer, amount)
+    local price = NormalizePrice(amount)
+    if not price then
+        Notify(src, '~r~Ungültiger Preis', 'error')
+        return false
+    end
+    if xPlayer.getMoney() < price then
+        Notify(src, '~r~Zu wenig Geld! Preis: $' .. price, 'error')
+        return false
+    end
+
+    xPlayer.removeMoney(price)
+    DepositSocietyMoney(price)
+    RecordRevenue(price)
+    return true, price
+end
+
+local function ValidateCustomer(src, requireSession)
+    local xPlayer = ESX.GetPlayerFromId(src)
+    local job = GetPlayerJob(xPlayer)
+    if not xPlayer or not job then return nil end
+    if not IsJobAllowed(job.name, job.grade) then
+        Notify(src, '~r~Du hast nicht den erforderlichen Job', 'error')
+        return nil
+    end
+
+    if requireSession then
+        local session = PlayerSessions[src]
+        if not session or not IsPlayerNearTable(src, session.tableId) then
+            Notify(src, '~r~Du benötigst eine aktive Shisha-Session am Tisch', 'error')
+            return nil
+        end
+    elseif not IsPlayerNearAnyTable(src) then
+        Notify(src, '~r~Du musst dich an einem Shisha-Tisch befinden', 'error')
+        return nil
+    end
+
+    local cooldown = (Config.Security and Config.Security.purchaseCooldownMs) or 500
+    if not CheckRateLimit(src, 'purchase', cooldown) then
+        Notify(src, '~y~Bitte warte einen Moment', 'inform')
+        return nil
+    end
+    return xPlayer
+end
 
 local function GetTableOccupancy()
     local occupancy = {}
@@ -21,259 +202,270 @@ end
 
 local function AddPlayerXP(src, amount)
     local xPlayer = ESX.GetPlayerFromId(src)
-    if not xPlayer then return end
+    local numericAmount = tonumber(amount)
+    if not xPlayer or not IsFiniteNumber(numericAmount) or numericAmount <= 0 then return end
+    numericAmount = math.min(math.floor(numericAmount), 1000)
 
     -- Berechne Job-XP-Multiplikator
     local multiplier = 1.0
     if Config.JobFunctions and Config.JobFunctions.xpMultiplier then
-        local jobGrade = xPlayer.getJob().grade
+        local jobGrade = math.max(0, math.min(tonumber(xPlayer.getJob().grade) or 0, 5))
         multiplier = Config.JobFunctions.xpMultiplier[jobGrade] or 1.0
     end
 
-    local effectiveXP = math.floor(amount * multiplier)
+    local effectiveXP = math.floor(numericAmount * multiplier)
+    local state = PlayerXP[src] or {total = 0, xp = 0, level = 1}
+    local oldLevel = state.level
+    state.total = math.min((state.total or 0) + effectiveXP, MAX_XP_CAP)
+    state.level = math.floor(state.total / XP_PER_LEVEL) + 1
+    state.xp = state.total % XP_PER_LEVEL
+    PlayerXP[src] = state
 
-    PlayerXP[src] = PlayerXP[src] or {xp = 0, level = 1}
-    PlayerXP[src].xp = PlayerXP[src].xp + effectiveXP
-
-    if PlayerXP[src].xp >= 100 then
-        PlayerXP[src].xp = PlayerXP[src].xp - 100
-        PlayerXP[src].level = PlayerXP[src].level + 1
-        TriggerClientEvent('shisha:levelUp', src, PlayerXP[src].level)
-        TriggerClientEvent('shisha:notify', src, "~g~Level Up! Neues Level: " .. PlayerXP[src].level, 'success')
-
-        -- Prüfe auf Job-Progression Belohnungen
-        if Config.JobFunctions and Config.JobFunctions.progressionRewards then
-            local reward = Config.JobFunctions.progressionRewards[PlayerXP[src].level]
+    if state.level > oldLevel then
+        for newLevel = oldLevel + 1, state.level do
+            TriggerClientEvent('shisha:levelUp', src, newLevel)
+            local reward = Config.JobFunctions and Config.JobFunctions.progressionRewards and Config.JobFunctions.progressionRewards[newLevel]
             if reward and reward.type == "bonus" then
                 xPlayer.addMoney(reward.amount)
-                TriggerClientEvent('shisha:notify', src, "~g~" .. reward.message, 'success')
+                Notify(src, "~g~" .. reward.message, 'success')
             end
         end
     end
 
-    TriggerClientEvent('shisha:updateHUD', src, PlayerXP[src])
+    TriggerClientEvent('shisha:updateHUD', src, {xp = state.xp, level = state.level})
 end
 
--- Prüfe ob Job erlaubt ist
-function IsJobAllowed(jobName, jobGrade)
-    if not Config.JobRequired then return true end
-    
-    if Config.UseMultipleJobs then
-        for _, job in ipairs(Config.AllowedJobs) do
-            if jobName == job[1] and jobGrade >= job[2] then
-                return true
-            end
-        end
-        return false
-    else
-        return jobName == Config.Job and jobGrade >= Config.JobGradeRequired
-    end
-end
-
-RegisterNetEvent('shisha:order', function(tableId)
-    local src = source
+lib.callback.register('shisha:getMenuData', function(src)
     local xPlayer = ESX.GetPlayerFromId(src)
-    local table = Config.Tables[tableId]
-
-    if not table then 
-        TriggerClientEvent('shisha:notify', src, "~r~Tisch nicht gefunden", 'error')
-        return 
+    local job = GetPlayerJob(xPlayer)
+    if not xPlayer or not job or not IsJobAllowed(job.name, job.grade) then
+        Notify(src, '~r~Du hast nicht den erforderlichen Job', 'error')
+        return nil
+    end
+    if not IsPlayerNearAnyTable(src) then
+        Notify(src, '~r~Du musst dich an einem Shisha-Tisch befinden', 'error')
+        return nil
     end
 
-    if not xPlayer then return end
+    local result = {
+        drinks = {},
+        trays = {},
+        mixes = {},
+        coal = Config.Coal,
+        flavors = Config.Flavors,
+        jobDiscounts = {
+            drinks = GetDiscountForPlayer(xPlayer, 'drinks'),
+            tables = GetDiscountForPlayer(xPlayer, 'tables')
+        }
+    }
 
-    -- Überprüfe Job-Anforderung
-    if not IsJobAllowed(xPlayer.getJob().name, xPlayer.getJob().grade) then
-        local jobText = "erforderlich"
-        if Config.UseMultipleJobs then
-            jobText = "Jobs: "
-            for _, job in ipairs(Config.AllowedJobs) do
-                jobText = jobText .. job[1] .. " (Grade " .. job[2] .. "+), "
-            end
-            jobText = string.sub(jobText, 1, -3)
-        else
-            jobText = "Job: " .. Config.Job .. " (Grade " .. Config.JobGradeRequired .. "+)"
+    for name, data in pairs(Config.Drinks) do
+        result.drinks[name] = {price = GetEffectivePrice(xPlayer, data.price, 'drinks'), originalPrice = data.price}
+    end
+    for name, data in pairs(Config.Trays) do
+        if IsItemAvailableForJob(xPlayer, name) then
+            result.trays[name] = {
+                price = GetEffectivePrice(xPlayer, data.price, 'drinks'), originalPrice = data.price,
+                description = data.description, effect = data.effect, xp = data.xp
+            }
         end
-        TriggerClientEvent('shisha:notify', src, "~r~" .. jobText, 'error')
+    end
+    for name, data in pairs(Config.AlcoholMixes) do
+        if IsItemAvailableForJob(xPlayer, name) then
+            result.mixes[name] = {
+                price = GetEffectivePrice(xPlayer, data.price, 'drinks'), originalPrice = data.price,
+                description = data.description, effect = data.effect, xp = data.xp
+            }
+        end
+    end
+
+    return result
+end)
+
+RegisterNetEvent('shisha:order', function(rawTableId)
+    local src = source
+    local tableId = tonumber(rawTableId)
+    if not tableId or tableId % 1 ~= 0 then
+        Notify(src, '~r~Ungültiger Tisch', 'error')
         return
     end
 
-    if xPlayer.getMoney() < table.price then
-        TriggerClientEvent('shisha:notify', src, "~r~Zu wenig Geld! Benötigt: $" .. table.price, 'error')
+    local tableConfig = Config.Tables[tableId]
+    local xPlayer = ESX.GetPlayerFromId(src)
+    local job = GetPlayerJob(xPlayer)
+    if not tableConfig or not xPlayer or not job then return end
+    if not CheckRateLimit(src, 'order', 1000) then return end
+    if not IsJobAllowed(job.name, job.grade) then
+        Notify(src, '~r~Du hast nicht den erforderlichen Job', 'error')
         return
     end
-
-    local occupancy = GetTableOccupancy()
-    if occupancy[tableId] then
-        TriggerClientEvent('shisha:notify', src, "~r~Dieser Tisch ist bereits belegt", 'error')
+    if not IsPlayerNearTable(src, tableId) then
+        Notify(src, '~r~Du bist zu weit von diesem Tisch entfernt', 'error')
         return
     end
-
-    -- Check ob Spieler bereits in einer Session ist
+    if GetTableOccupancy()[tableId] then
+        Notify(src, '~r~Dieser Tisch ist bereits belegt', 'error')
+        return
+    end
     if PlayerSessions[src] then
-        TriggerClientEvent('shisha:notify', src, "~r~Du bist bereits in einer Session", 'error')
+        Notify(src, '~r~Du bist bereits in einer Session', 'error')
         return
     end
 
-    xPlayer.removeMoney(table.price)
+    local price = GetEffectivePrice(xPlayer, tableConfig.price, 'tables')
+    local paid, chargedPrice = ChargePlayer(src, xPlayer, price)
+    if not paid then return end
 
-    TriggerEvent('esx_addonaccount:getSharedAccount', 'society_shisha', function(account)
-        if account then
-            account.addMoney(table.price)
-        end
-    end)
-
-    PlayerSessions[src] = {tableId = tableId}
+    local hasCoal = (PlayerCoal[src] or 0) > 0
+    if hasCoal then PlayerCoal[src] = PlayerCoal[src] - 1 end
+    PlayerSessions[src] = {tableId = tableId, active = hasCoal, smokeCount = 0}
+    RefreshDailyStats()
+    RuntimeStats.sessionToday = RuntimeStats.sessionToday + 1
     UpdateTableOccupancy()
-    TriggerClientEvent('shisha:startSession', src, tableId)
-    TriggerClientEvent('shisha:notify', src, "~g~" .. table.label .. " gebucht!", 'success')
+    TriggerClientEvent('shisha:startSession', src, tableId, hasCoal)
+    Notify(src, '~g~' .. tableConfig.label .. ' für $' .. chargedPrice .. ' gebucht!', 'success')
+    if not hasCoal then Notify(src, '~y~Kaufe Kohle, um mit dem Rauchen zu beginnen', 'inform') end
 end)
 
 RegisterNetEvent('shisha:buyDrink', function(drink)
     local src = source
-    local xPlayer = ESX.GetPlayerFromId(src)
-    local data = Config.Drinks[drink]
-
-    if not data then
-        TriggerClientEvent('shisha:notify', src, "~r~Getränk nicht gefunden", 'error')
-        return
-    end
-
+    local data = type(drink) == 'string' and Config.Drinks[drink]
+    if not data then Notify(src, '~r~Getränk nicht gefunden', 'error') return end
+    local xPlayer = ValidateCustomer(src, false)
     if not xPlayer then return end
-
-    if xPlayer.getMoney() < data.price then
-        TriggerClientEvent('shisha:notify', src, "~r~Zu wenig Geld! Preis: $" .. data.price, 'error')
-        return
-    end
-
-    xPlayer.removeMoney(data.price)
-    TriggerClientEvent('shisha:drinkEffect', src)
-    TriggerClientEvent('shisha:notify', src, "~g~" .. drink .. " gekauft!", 'success')
+    if not ChargePlayer(src, xPlayer, GetEffectivePrice(xPlayer, data.price, 'drinks')) then return end
+    TriggerClientEvent('shisha:drinkEffect', src, data.effect)
+    Notify(src, '~g~' .. drink .. ' gekauft!', 'success')
 end)
 
 RegisterNetEvent('shisha:buyAlcoholMix', function(mix)
     local src = source
-    local xPlayer = ESX.GetPlayerFromId(src)
-    local data = Config.AlcoholMixes[mix]
-
-    if not data then
-        TriggerClientEvent('shisha:notify', src, "~r~Alkohol-Mischung nicht gefunden", 'error')
+    local data = type(mix) == 'string' and Config.AlcoholMixes[mix]
+    if not data then Notify(src, '~r~Alkohol-Mischung nicht gefunden', 'error') return end
+    local xPlayer = ValidateCustomer(src, false)
+    if not xPlayer or not IsItemAvailableForJob(xPlayer, mix) then
+        if xPlayer then Notify(src, '~r~Dein Job-Grad reicht für diesen Artikel nicht aus', 'error') end
         return
     end
-
-    if not xPlayer then return end
-
-    if xPlayer.getMoney() < data.price then
-        TriggerClientEvent('shisha:notify', src, "~r~Zu wenig Geld! Preis: $" .. data.price, 'error')
-        return
-    end
-
-    xPlayer.removeMoney(data.price)
+    if not ChargePlayer(src, xPlayer, GetEffectivePrice(xPlayer, data.price, 'drinks')) then return end
     TriggerClientEvent('shisha:drinkEffect', src, data.effect)
-    AddPlayerXP(src, 15)
-    TriggerClientEvent('shisha:notify', src, "~g~" .. mix .. " gekauft!", 'success')
+    AddPlayerXP(src, data.xp or 15)
+    Notify(src, '~g~' .. mix .. ' gekauft!', 'success')
 end)
 
 RegisterNetEvent('shisha:buyTray', function(tray)
     local src = source
-    local xPlayer = ESX.GetPlayerFromId(src)
-    local data = Config.Trays[tray]
-
-    if not data then
-        TriggerClientEvent('shisha:notify', src, "~r~Tablett nicht gefunden", 'error')
+    local data = type(tray) == 'string' and Config.Trays[tray]
+    if not data then Notify(src, '~r~Tablett nicht gefunden', 'error') return end
+    local xPlayer = ValidateCustomer(src, false)
+    if not xPlayer or not IsItemAvailableForJob(xPlayer, tray) then
+        if xPlayer then Notify(src, '~r~Dein Job-Grad reicht für diesen Artikel nicht aus', 'error') end
         return
     end
-
-    if not xPlayer then return end
-
-    if xPlayer.getMoney() < data.price then
-        TriggerClientEvent('shisha:notify', src, "~r~Zu wenig Geld! Preis: $" .. data.price, 'error')
-        return
-    end
-
-    xPlayer.removeMoney(data.price)
+    if not ChargePlayer(src, xPlayer, GetEffectivePrice(xPlayer, data.price, 'drinks')) then return end
     TriggerClientEvent('shisha:trayEffect', src, data.effect)
     AddPlayerXP(src, data.xp or 5)
-    TriggerClientEvent('shisha:notify', src, "~g~" .. tray .. " gekauft!", 'success')
+    Notify(src, '~g~' .. tray .. ' gekauft!', 'success')
 end)
 
 RegisterNetEvent('shisha:buyCoal', function()
     local src = source
-    local xPlayer = ESX.GetPlayerFromId(src)
-    local data = Config.Coal
+    local xPlayer = ValidateCustomer(src, false)
+    if not xPlayer or not Config.Coal then return end
+    if not ChargePlayer(src, xPlayer, Config.Coal.price) then return end
 
-    if not xPlayer then return end
-    if not data then
-        TriggerClientEvent('shisha:notify', src, "~r~Kohle-Konfiguration nicht gefunden", 'error')
-        return
+    local session = PlayerSessions[src]
+    if session and not session.active and IsPlayerNearTable(src, session.tableId) then
+        session.active = true
+        session.smokeCount = 0
+        TriggerClientEvent('shisha:coalReady', src)
+    else
+        PlayerCoal[src] = (PlayerCoal[src] or 0) + (tonumber(Config.Coal.uses) or 1)
+        TriggerClientEvent('shisha:addCoal', src)
     end
-
-    if xPlayer.getMoney() < data.price then
-        TriggerClientEvent('shisha:notify', src, "~r~Zu wenig Geld! Preis: $" .. data.price, 'error')
-        return
-    end
-
-    xPlayer.removeMoney(data.price)
-    TriggerClientEvent('shisha:addCoal', src)
-    TriggerClientEvent('shisha:notify', src, "~g~" .. data.name .. " gekauft!", 'success')
+    Notify(src, '~g~' .. Config.Coal.name .. ' gekauft!', 'success')
 end)
 
 RegisterNetEvent('shisha:buyFlavor', function(flavor)
     local src = source
-    local xPlayer = ESX.GetPlayerFromId(src)
-    local data = Config.Flavors[flavor]
+    local data = type(flavor) == 'string' and Config.Flavors[flavor]
+    if not data then Notify(src, '~r~Aroma nicht gefunden', 'error') return end
+    if not ValidateCustomer(src, true) then return end
+    local session = PlayerSessions[src]
+    if session.flavor then
+        Notify(src, '~y~Für diese Session wurde bereits ein Aroma gewählt', 'inform')
+        return
+    end
+    session.flavor = flavor
+    TriggerClientEvent('shisha:flavorEffect', src, data.effect)
+    AddPlayerXP(src, data.xp or 0)
+    Notify(src, '~g~' .. flavor .. ' Aroma aktiviert!', 'success')
+end)
 
-    if not data then
-        TriggerClientEvent('shisha:notify', src, "~r~Aroma nicht gefunden", 'error')
+RegisterNetEvent('shisha:smoke', function()
+    local src = source
+    local session = PlayerSessions[src]
+    if not session or not session.active then
+        Notify(src, '~r~Du benötigst eine aktive Session mit Kohle', 'error')
+        return
+    end
+    if not IsPlayerNearTable(src, session.tableId) then
+        Notify(src, '~r~Du bist zu weit von deinem Tisch entfernt', 'error')
         return
     end
 
-    if not xPlayer then return end
-
-    -- Aromen kosten vielleicht Geld oder XP, hier kostenlos für Einfachheit
-    TriggerClientEvent('shisha:flavorEffect', src, data.effect)
-    TriggerClientEvent('shisha:notify', src, "~g~" .. flavor .. " Aroma aktiviert!", 'success')
-end)
-
-RegisterNetEvent('shisha:addXP', function(amount)
-    local src = source
-
-    PlayerXP[src] = PlayerXP[src] or {xp = 0, level = 1}
-    PlayerXP[src].xp = PlayerXP[src].xp + amount
-
-    if PlayerXP[src].xp >= 100 then
-        PlayerXP[src].xp = 0
-        PlayerXP[src].level = PlayerXP[src].level + 1
-        TriggerClientEvent('shisha:levelUp', src, PlayerXP[src].level)
-        TriggerClientEvent('shisha:notify', src, "~g~Level Up! Neues Level: " .. PlayerXP[src].level, 'success')
+    local cooldown = (Config.Security and Config.Security.smokeCooldownMs) or 3000
+    if not CheckRateLimit(src, 'smoke', cooldown) then
+        Notify(src, '~y~Warte kurz bis zum nächsten Zug', 'inform')
+        return
     end
 
-    TriggerClientEvent('shisha:updateHUD', src, PlayerXP[src])
-end)
+    local maxSmokes = (Config.Security and Config.Security.maxSmokesPerSession) or 5
+    session.smokeCount = (session.smokeCount or 0) + 1
+    AddPlayerXP(src, (Config.Security and Config.Security.smokeXP) or 10)
+    TriggerClientEvent('shisha:performSmoke', src, session.smokeCount, maxSmokes)
 
-RegisterNetEvent('shisha:endSession', function()
-    local src = source
-    if PlayerSessions[src] then
+    if session.smokeCount >= maxSmokes then
         PlayerSessions[src] = nil
         UpdateTableOccupancy()
-        TriggerClientEvent('shisha:notify', src, "~y~Session beendet", 'info')
+        TriggerClientEvent('shisha:sessionCompleted', src)
     end
+end)
+
+local function EndPlayerSession(src, message)
+    if not PlayerSessions[src] then return false end
+    PlayerSessions[src] = nil
+    UpdateTableOccupancy()
+    TriggerClientEvent('shisha:sessionEnded', src)
+    Notify(src, message, 'inform')
+    return true
+end
+
+RegisterNetEvent('shisha:endSession', function()
+    EndPlayerSession(source, '~y~Session beendet')
 end)
 
 RegisterNetEvent('shisha:cancelSession', function()
-    local src = source
-    if PlayerSessions[src] then
-        PlayerSessions[src] = nil
-        UpdateTableOccupancy()
-        TriggerClientEvent('shisha:notify', src, "~y~Shisha-Sitzung abgebrochen", 'info')
-    else
-        TriggerClientEvent('shisha:notify', src, "~y~Du hast keine aktive Shisha-Sitzung.", 'info')
+    if not EndPlayerSession(source, '~y~Shisha-Sitzung abgebrochen') then
+        Notify(source, '~y~Du hast keine aktive Shisha-Sitzung.', 'inform')
     end
 end)
 
 RegisterNetEvent('shisha:requestTableOccupancy', function()
     local src = source
     TriggerClientEvent('shisha:updateTableOccupancy', src, GetTableOccupancy())
+    local state = PlayerXP[src] or {xp = 0, level = 1}
+    TriggerClientEvent('shisha:updateHUD', src, {xp = state.xp or 0, level = state.level or 1})
+end)
+
+AddEventHandler('playerDropped', function()
+    local src = source
+    local hadSession = PlayerSessions[src] ~= nil
+    PlayerSessions[src] = nil
+    PlayerXP[src] = nil
+    PlayerCoal[src] = nil
+    RateLimits[src] = nil
+    if hadSession then UpdateTableOccupancy() end
 end)
 
 -- Admin Command um alle Sessions zu sehen
@@ -281,7 +473,7 @@ TriggerEvent('chat:addSuggestion', '/shisha_sessions', 'Zeige alle aktiven Shish
 
 RegisterCommand('shisha_sessions', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
@@ -309,13 +501,13 @@ TriggerEvent('chat:addSuggestion', '/shisha_price', 'Ändere Tisch-Preis: /shish
 
 RegisterCommand('shisha_price', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
 
     local tableId = tonumber(args[1])
-    local price = tonumber(args[2])
+    local price = NormalizePrice(args[2])
 
     if not tableId or not price then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~FEHLER', 'Syntax: /shisha_price [tableId] [price]'}})
@@ -335,13 +527,13 @@ TriggerEvent('chat:addSuggestion', '/shisha_drink_price', 'Ändere Getränk-Prei
 
 RegisterCommand('shisha_drink_price', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
 
     local drinkName = args[1]
-    local price = tonumber(args[2])
+    local price = NormalizePrice(args[2])
 
     if not drinkName or not price then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~FEHLER', 'Syntax: /shisha_drink_price [name] [price]'}})
@@ -361,7 +553,7 @@ TriggerEvent('chat:addSuggestion', '/shisha_job', 'Ändere Job-Anforderung: /shi
 
 RegisterCommand('shisha_job', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
@@ -388,7 +580,7 @@ TriggerEvent('chat:addSuggestion', '/shisha_config', 'Zeige aktuelle Shisha-Konf
 
 RegisterCommand('shisha_config', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
@@ -399,8 +591,8 @@ RegisterCommand('shisha_config', function(source, args, rawCommand)
         TriggerClientEvent('chat:addMessage', source, {args = {'', 'Job: ' .. Config.Job .. ' | Grade: ' .. Config.JobGradeRequired .. '+'}})
     end
     TriggerClientEvent('chat:addMessage', source, {args = {'', 'Tische: ' .. #Config.Tables}})
-    TriggerClientEvent('chat:addMessage', source, {args = {'', 'Getränke: ' .. #Config.Drinks}})
-    TriggerClientEvent('chat:addMessage', source, {args = {'', 'Aromen: ' .. #Config.Flavors}})
+    TriggerClientEvent('chat:addMessage', source, {args = {'', 'Getränke: ' .. CountEntries(Config.Drinks)}})
+    TriggerClientEvent('chat:addMessage', source, {args = {'', 'Aromen: ' .. CountEntries(Config.Flavors)}})
     TriggerClientEvent('chat:addMessage', source, {args = {'~b~SHISHA CONFIG', '═════════════════════'}})
 end, false)
 
@@ -409,14 +601,14 @@ TriggerEvent('chat:addSuggestion', '/shisha_tables', 'Zeige alle Tische mit Prei
 
 RegisterCommand('shisha_tables', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
 
     TriggerClientEvent('chat:addMessage', source, {args = {'~b~SHISHA TISCHE', '═════════════════════'}})
-    for i, table in ipairs(Config.Tables) do
-        TriggerClientEvent('chat:addMessage', source, {args = {'', 'ID: ' .. i .. ' | ' .. table.label .. ' | Preis: $' .. table.price}})
+    for i, tableConfig in ipairs(Config.Tables) do
+        TriggerClientEvent('chat:addMessage', source, {args = {'', 'ID: ' .. i .. ' | ' .. tableConfig.label .. ' | Preis: $' .. tableConfig.price}})
     end
     TriggerClientEvent('chat:addMessage', source, {args = {'~b~SHISHA TISCHE', '═════════════════════'}})
 end, false)
@@ -426,7 +618,7 @@ TriggerEvent('chat:addSuggestion', '/shisha_drinks', 'Zeige alle Getränke mit P
 
 RegisterCommand('shisha_drinks', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
@@ -443,7 +635,7 @@ TriggerEvent('chat:addSuggestion', '/shisha_flavors', 'Zeige alle Aromen')
 
 RegisterCommand('shisha_flavors', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
@@ -460,7 +652,7 @@ TriggerEvent('chat:addSuggestion', '/shisha_help', 'Zeige alle Admin-Commands f�
 
 RegisterCommand('shisha_help', function(source, args, rawCommand)
     local xPlayer = ESX.GetPlayerFromId(source)
-    if xPlayer.getGroup() ~= 'admin' then
+    if not xPlayer or not xPlayer.getGroup or xPlayer.getGroup() ~= 'admin' then
         TriggerClientEvent('chat:addMessage', source, {args = {'~r~ADMIN', 'Du hast keine Berechtigung!'}})
         return
     end
@@ -514,34 +706,50 @@ RegisterNetEvent('shisha:adminAction', function(action, payload)
         return
     end
 
+    payload = type(payload) == 'table' and payload or {}
+
     if action == 'toggleHudEnabled' then
         Config.HUD.enabled = not Config.HUD.enabled
-        TriggerClientEvent('shisha:notify', src, '~g~HUD ' .. (Config.HUD.enabled and 'aktiviert' or 'deaktiviert'), 'success')
+        Notify(src, '~g~HUD ' .. (Config.HUD.enabled and 'aktiviert' or 'deaktiviert'), 'success')
     elseif action == 'toggleJobRequired' then
         Config.JobRequired = not Config.JobRequired
-        TriggerClientEvent('shisha:notify', src, '~g~Job-Anforderung ' .. (Config.JobRequired and 'aktiviert' or 'deaktiviert'), 'success')
-    elseif action == 'setJob' and payload and payload.jobName then
-        Config.Job = tostring(payload.jobName)
-        TriggerClientEvent('shisha:notify', src, '~g~Job geändert auf: ' .. Config.Job, 'success')
-    elseif action == 'setJobGrade' and payload and payload.grade ~= nil then
-        Config.JobGradeRequired = tonumber(payload.grade) or 0
-        TriggerClientEvent('shisha:notify', src, '~g~Job-Grad geändert auf: ' .. Config.JobGradeRequired, 'success')
-    elseif action == 'setTablePrice' and payload and payload.tableId and payload.price then
-        if Config.Tables[payload.tableId] then
-            Config.Tables[payload.tableId].price = tonumber(payload.price) or Config.Tables[payload.tableId].price
-            TriggerClientEvent('shisha:notify', src, '~g~Preis für Tisch ' .. payload.tableId .. ' aktualisiert', 'success')
+        Notify(src, '~g~Job-Anforderung ' .. (Config.JobRequired and 'aktiviert' or 'deaktiviert'), 'success')
+    elseif action == 'setJob' and payload.jobName then
+        local jobName = tostring(payload.jobName)
+        if jobName:match('^[%w_%-]+$') and #jobName <= 32 then
+            Config.Job = jobName
+            Notify(src, '~g~Job geändert auf: ' .. Config.Job, 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Tisch nicht gefunden', 'error')
+            Notify(src, '~r~Ungültiger Job-Name', 'error')
         end
-    elseif action == 'setDrinkPrice' and payload and payload.drinkName and payload.price then
-        if Config.Drinks[payload.drinkName] then
-            Config.Drinks[payload.drinkName].price = tonumber(payload.price) or Config.Drinks[payload.drinkName].price
-            TriggerClientEvent('shisha:notify', src, '~g~Preis für ' .. payload.drinkName .. ' aktualisiert', 'success')
+    elseif action == 'setJobGrade' and payload.grade ~= nil then
+        local grade = tonumber(payload.grade)
+        if IsFiniteNumber(grade) and grade >= 0 and grade <= 100 then
+            Config.JobGradeRequired = math.floor(grade)
+            Notify(src, '~g~Job-Grad geändert auf: ' .. Config.JobGradeRequired, 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Getränk nicht gefunden', 'error')
+            Notify(src, '~r~Ungültiger Job-Grad', 'error')
+        end
+    elseif action == 'setTablePrice' then
+        local tableId = tonumber(payload.tableId)
+        local price = NormalizePrice(payload.price)
+        if tableId and tableId % 1 == 0 and price and Config.Tables[tableId] then
+            Config.Tables[tableId].price = price
+            Notify(src, '~g~Preis für Tisch ' .. tableId .. ' aktualisiert', 'success')
+        else
+            Notify(src, '~r~Ungültiger Tisch oder Preis', 'error')
+        end
+    elseif action == 'setDrinkPrice' then
+        local drinkName = type(payload.drinkName) == 'string' and payload.drinkName
+        local price = NormalizePrice(payload.price)
+        if drinkName and price and Config.Drinks[drinkName] then
+            Config.Drinks[drinkName].price = price
+            Notify(src, '~g~Preis für ' .. drinkName .. ' aktualisiert', 'success')
+        else
+            Notify(src, '~r~Ungültiges Getränk oder Preis', 'error')
         end
     else
-        TriggerClientEvent('shisha:notify', src, '~r~Unbekannte Admin-Aktion', 'error')
+        Notify(src, '~r~Unbekannte Admin-Aktion', 'error')
     end
 
     TriggerClientEvent('shisha:setConfig', -1, {
@@ -570,7 +778,6 @@ RegisterNetEvent('shisha:openBossMenu', function()
         Job = Config.Job,
         JobGradeRequired = Config.JobGradeRequired,
         HUD = { enabled = Config.HUD.enabled },
-        KeyBindings = Config.KeyBindings,
         Tables = Config.Tables,
         Drinks = Config.Drinks,
         Trays = Config.Trays,
@@ -592,86 +799,101 @@ RegisterNetEvent('shisha:bossAction', function(action, data)
     local isBoss = xPlayer and xPlayer.getJob and xPlayer.getJob().name == Config.Job and xPlayer.getJob().grade >= Config.BossMenu.bossGradeRequired
     
     if not (isAdmin or isBoss) then
-        TriggerClientEvent('shisha:notify', src, 'Du hast keine Berechtigung!', 'error')
+        Notify(src, 'Du hast keine Berechtigung!', 'error')
         return
     end
 
-    -- Nur Admins dürfen bestimmte Aktionen durchführen
-    if action == 'updateConfig' and not isAdmin then
-        TriggerClientEvent('shisha:notify', src, 'Nur Admins können die Konfiguration ändern!', 'error')
+    data = type(data) == 'table' and data or {}
+
+    local adminOnly = action == 'updateConfig' or action == 'setServerTime' or action == 'updateKeyBindings'
+    if adminOnly and not isAdmin then
+        Notify(src, 'Nur Admins dürfen diese globale Einstellung ändern!', 'error')
         return
     end
 
     if action == 'updateConfig' then
-        if data.jobRequired ~= nil then Config.JobRequired = data.jobRequired end
-        if data.jobName then Config.Job = tostring(data.jobName) end
-        if data.jobGrade ~= nil then Config.JobGradeRequired = tonumber(data.jobGrade) or 0 end
+        if type(data.jobRequired) == 'boolean' then Config.JobRequired = data.jobRequired end
+        if data.jobName then
+            local jobName = tostring(data.jobName)
+            if not jobName:match('^[%w_%-]+$') or #jobName > 32 then
+                Notify(src, '~r~Ungültiger Job-Name', 'error')
+                return
+            end
+            Config.Job = jobName
+        end
+        if data.jobGrade ~= nil then
+            local grade = tonumber(data.jobGrade)
+            if not IsFiniteNumber(grade) or grade < 0 or grade > 100 then
+                Notify(src, '~r~Ungültiger Job-Grad', 'error')
+                return
+            end
+            Config.JobGradeRequired = math.floor(grade)
+        end
         
-        TriggerClientEvent('shisha:notify', src, '~g~Konfiguration aktualisiert!', 'success')
+        Notify(src, '~g~Konfiguration aktualisiert!', 'success')
         TriggerClientEvent('shisha:setConfig', -1, {
             JobRequired = Config.JobRequired,
             Job = Config.Job,
             JobGradeRequired = Config.JobGradeRequired,
-            HUD = { enabled = Config.HUD.enabled },
-            KeyBindings = Config.KeyBindings
+            HUD = { enabled = Config.HUD.enabled }
         })
     
     elseif action == 'updateTablePrice' then
         local tableId = tonumber(data.tableId)
-        local price = tonumber(data.price)
-        if tableId and price and Config.Tables[tableId] then
+        local price = NormalizePrice(data.price)
+        if tableId and tableId % 1 == 0 and price and Config.Tables[tableId] then
             Config.Tables[tableId].price = price
-            TriggerClientEvent('shisha:notify', src, '~g~Preis für Tisch ' .. tableId .. ' auf $' .. price .. ' gesetzt!', 'success')
+            Notify(src, '~g~Preis für Tisch ' .. tableId .. ' auf $' .. price .. ' gesetzt!', 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Ungültige Tisch-ID oder Preis', 'error')
+            Notify(src, '~r~Ungültige Tisch-ID oder Preis', 'error')
         end
     elseif action == 'setAllTablePrices' then
-        local price = tonumber(data.price)
+        local price = NormalizePrice(data.price)
         if price then
             for i, _ in ipairs(Config.Tables) do
                 Config.Tables[i].price = price
             end
-            TriggerClientEvent('shisha:notify', src, '~g~Alle Tischpreise auf $' .. price .. ' gesetzt!', 'success')
+            Notify(src, '~g~Alle Tischpreise auf $' .. price .. ' gesetzt!', 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Ungültiger Preis', 'error')
+            Notify(src, '~r~Ungültiger Preis', 'error')
         end
     elseif action == 'updateDrinkPrice' then
         local drinkName = tostring(data.drinkName or '')
-        local price = tonumber(data.price)
+        local price = NormalizePrice(data.price)
         if drinkName ~= '' and price and Config.Drinks[drinkName] then
             Config.Drinks[drinkName].price = price
-            TriggerClientEvent('shisha:notify', src, '~g~Preis für ' .. drinkName .. ' auf $' .. price .. ' gesetzt!', 'success')
+            Notify(src, '~g~Preis für ' .. drinkName .. ' auf $' .. price .. ' gesetzt!', 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Ungültiges Getränk oder Preis', 'error')
+            Notify(src, '~r~Ungültiges Getränk oder Preis', 'error')
         end
     elseif action == 'updateTrayPrice' then
         local trayName = tostring(data.trayName or '')
-        local price = tonumber(data.price)
+        local price = NormalizePrice(data.price)
         if trayName ~= '' and price and Config.Trays[trayName] then
             Config.Trays[trayName].price = price
-            TriggerClientEvent('shisha:notify', src, '~g~Preis für ' .. trayName .. ' auf $' .. price .. ' gesetzt!', 'success')
+            Notify(src, '~g~Preis für ' .. trayName .. ' auf $' .. price .. ' gesetzt!', 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Ungültiges Tablett oder Preis', 'error')
+            Notify(src, '~r~Ungültiges Tablett oder Preis', 'error')
         end
     elseif action == 'updateCoalPrice' then
-        local price = tonumber(data.price)
+        local price = NormalizePrice(data.price)
         if price then
             Config.Coal.price = price
-            TriggerClientEvent('shisha:notify', src, '~g~Kohlepreis auf $' .. price .. ' gesetzt!', 'success')
+            Notify(src, '~g~Kohlepreis auf $' .. price .. ' gesetzt!', 'success')
         else
-            TriggerClientEvent('shisha:notify', src, '~r~Ungültiger Kohlepreis', 'error')
+            Notify(src, '~r~Ungültiger Kohlepreis', 'error')
         end
     elseif action == 'getStats' then
+        RefreshDailyStats()
         local stats = {
             activePlayers = 0,
-            moneyToday = 0,
-            totalMoney = 0,
-            sessionToday = 0
+            moneyToday = RuntimeStats.moneyToday,
+            totalMoney = RuntimeStats.totalMoney,
+            sessionToday = RuntimeStats.sessionToday
         }
         
         for _, _ in pairs(PlayerSessions) do
             stats.activePlayers = stats.activePlayers + 1
-            stats.sessionToday = stats.sessionToday + 1
         end
         
         TriggerClientEvent('shisha:bossStats', src, stats)
@@ -682,27 +904,10 @@ RegisterNetEvent('shisha:bossAction', function(action, data)
         if minute < 0 then minute = 0 elseif minute > 59 then minute = 59 end
 
         TriggerClientEvent('shisha:setTime', -1, hour, minute)
-        TriggerClientEvent('shisha:notify', src, string.format('Serverzeit gesetzt auf %02d:%02d', hour, minute), 'success')
+        Notify(src, string.format('Serverzeit gesetzt auf %02d:%02d', hour, minute), 'success')
     elseif action == 'updateKeyBindings' then
-        Config.KeyBindings = Config.KeyBindings or {}
-        if data.menu ~= nil then Config.KeyBindings.menu = tonumber(data.menu) or Config.KeyBindings.menu end
-        if data.bossMenu ~= nil then Config.KeyBindings.bossMenu = tonumber(data.bossMenu) or Config.KeyBindings.bossMenu end
-        if data.bossMenuModifier ~= nil then Config.KeyBindings.bossMenuModifier = tonumber(data.bossMenuModifier) or Config.KeyBindings.bossMenuModifier end
-        if data.toggleHUD ~= nil then Config.KeyBindings.toggleHUD = tonumber(data.toggleHUD) or Config.KeyBindings.toggleHUD end
-        if data.smoke ~= nil then Config.KeyBindings.smoke = tonumber(data.smoke) or Config.KeyBindings.smoke end
-        Config.MenuKey = Config.KeyBindings.menu
-        Config.BossMenuKey = Config.KeyBindings.bossMenu
-        Config.BossMenuModifier = Config.KeyBindings.bossMenuModifier
-        Config.ToggleHUDKey = Config.KeyBindings.toggleHUD
-        Config.SmokeKey = Config.KeyBindings.smoke
-
-        TriggerClientEvent('shisha:notify', src, '~g~Tastenbelegung aktualisiert!', 'success')
-        TriggerClientEvent('shisha:setConfig', -1, {
-            JobRequired = Config.JobRequired,
-            Job = Config.Job,
-            JobGradeRequired = Config.JobGradeRequired,
-            HUD = { enabled = Config.HUD.enabled },
-            KeyBindings = Config.KeyBindings
-        })
+        Notify(src, '~y~Tasten werden von jedem Spieler in den FiveM-Einstellungen geändert', 'inform')
+    else
+        Notify(src, '~r~Unbekannte Boss-Aktion', 'error')
     end
 end)

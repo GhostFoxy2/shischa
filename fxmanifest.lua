@@ -9,6 +9,8 @@ version '12.0.0'
 
 dependency 'ox_target'
 dependency 'ox_lib'
+dependency 'es_extended'
+dependency 'esx_addonaccount'
 shared_script '@ox_lib/init.lua'
 shared_scripts {'config.lua'}
 client_scripts {'client.lua'}

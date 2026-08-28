@@ -1,5 +1,9 @@
+const resourceName = typeof GetParentResourceName === 'function' ? GetParentResourceName() : 'shisha_final';
+const nuiUrl = endpoint => `https://${resourceName}/${endpoint}`;
+
 window.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && document.getElementById('menu').style.display === 'block') {
+    const menuOpen = ['menu', 'adminMenu', 'bossMenu'].some(id => document.getElementById(id).style.display === 'block');
+    if (e.key === 'Escape' && menuOpen) {
         closeMenu();
     }
 });
@@ -33,6 +37,19 @@ window.addEventListener('message', function(e){
     }
 })
 
+function setProductButtonLabel(button, name, data, discountPercent) {
+    button.textContent = `${name} - `;
+    if (data.originalPrice && data.price < data.originalPrice && discountPercent > 0) {
+        const original = document.createElement('span');
+        original.style.textDecoration = 'line-through';
+        original.style.color = '#888';
+        original.textContent = `$${data.originalPrice}`;
+        button.append(original, document.createTextNode(` $${data.price} (${Math.round(discountPercent)}% Rabatt)`));
+    } else {
+        button.append(document.createTextNode(`$${data.price}`));
+    }
+}
+
 function showMenu(drinks, trays, coal, mixes, flavors, jobDiscounts) {
     const menu = document.getElementById('menu');
     const drinksDiv = document.getElementById('drinks');
@@ -44,16 +61,11 @@ function showMenu(drinks, trays, coal, mixes, flavors, jobDiscounts) {
     drinksDiv.innerHTML = '<h3>Getränke</h3>';
     for (const [name, data] of Object.entries(drinks)) {
         const btn = document.createElement('button');
-        let priceText = `$${data.price}`;
-        if (data.originalPrice && data.price < data.originalPrice && jobDiscounts && jobDiscounts.drinks > 0) {
-            const discountPercent = Math.round(jobDiscounts.drinks);
-            priceText = `<span style="text-decoration: line-through; color: #888;">$${data.originalPrice}</span> $${data.price} (${discountPercent}% Rabatt)`;
-        }
-        btn.innerHTML = `${name} - ${priceText}`;
+        setProductButtonLabel(btn, name, data, jobDiscounts.drinks || 0);
         btn.className = 'menu-btn';
         btn.onclick = () => {
             if (window.fetch) {
-                fetch(`https://shisha_final/buyDrink`, {
+                fetch(nuiUrl('buyDrink'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ drink: name })
@@ -67,16 +79,11 @@ function showMenu(drinks, trays, coal, mixes, flavors, jobDiscounts) {
     traysDiv.innerHTML = '<h3>Tabletts</h3>';
     for (const [name, data] of Object.entries(trays)) {
         const btn = document.createElement('button');
-        let priceText = `$${data.price}`;
-        if (data.originalPrice && data.price < data.originalPrice && jobDiscounts && jobDiscounts.drinks > 0) {
-            const discountPercent = Math.round(jobDiscounts.drinks);
-            priceText = `<span style="text-decoration: line-through; color: #888;">$${data.originalPrice}</span> $${data.price} (${discountPercent}% Rabatt)`;
-        }
-        btn.innerHTML = `${name} - ${priceText}`;
+        setProductButtonLabel(btn, name, data, jobDiscounts.drinks || 0);
         btn.className = 'menu-btn tray-btn';
         btn.onclick = () => {
             if (window.fetch) {
-                fetch(`https://shisha_final/buyTray`, {
+                fetch(nuiUrl('buyTray'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ tray: name })
@@ -98,7 +105,7 @@ function showMenu(drinks, trays, coal, mixes, flavors, jobDiscounts) {
         btn.className = 'menu-btn coal-btn';
         btn.onclick = () => {
             if (window.fetch) {
-                fetch(`https://shisha_final/buyCoal`, {
+                fetch(nuiUrl('buyCoal'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 }).catch(e => console.error('Fehler beim Kaufen:', e));
@@ -117,16 +124,11 @@ function showMenu(drinks, trays, coal, mixes, flavors, jobDiscounts) {
     mixesDiv.innerHTML = '<h3>Alkohol-Mischungen</h3>';
     for (const [name, data] of Object.entries(mixes)) {
         const btn = document.createElement('button');
-        let priceText = `$${data.price}`;
-        if (data.originalPrice && data.price < data.originalPrice && jobDiscounts && jobDiscounts.drinks > 0) {
-            const discountPercent = Math.round(jobDiscounts.drinks);
-            priceText = `<span style="text-decoration: line-through; color: #888;">$${data.originalPrice}</span> $${data.price} (${discountPercent}% Rabatt)`;
-        }
-        btn.innerHTML = `${name} - ${priceText}`;
+        setProductButtonLabel(btn, name, data, jobDiscounts.drinks || 0);
         btn.className = 'menu-btn mix-btn';
         btn.onclick = () => {
             if (window.fetch) {
-                fetch(`https://shisha_final/buyMix`, {
+                fetch(nuiUrl('buyMix'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ mix: name })
@@ -144,7 +146,7 @@ function showMenu(drinks, trays, coal, mixes, flavors, jobDiscounts) {
         btn.className = 'menu-btn';
         btn.onclick = () => {
             if (window.fetch) {
-                fetch(`https://shisha_final/buyFlavor`, {
+                fetch(nuiUrl('buyFlavor'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ flavor: name })
@@ -163,7 +165,7 @@ function closeMenu() {
     document.getElementById('adminMenu').style.display = 'none';
     document.getElementById('bossMenu').style.display = 'none';
     if (window.fetch) {
-        fetch(`https://shisha_final/closeMenu`, { method: 'POST' }).catch(e => console.error('Fehler beim Schließen:', e));
+        fetch(nuiUrl('closeMenu'), { method: 'POST' }).catch(e => console.error('Fehler beim Schließen:', e));
     }
 }
 
@@ -235,7 +237,7 @@ function showAdminMenu(config) {
 
 function sendAdminAction(action, payload = {}) {
     if (window.fetch) {
-        fetch(`https://shisha_final/adminAction`, {
+        fetch(nuiUrl('adminAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action, payload })
@@ -257,6 +259,26 @@ function safeId(name) {
     return name.toString().replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+function appendPriceRow(container, label, inputId, price, onSave) {
+    const row = document.createElement('div');
+    row.className = 'price-row';
+
+    const name = document.createElement('span');
+    name.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.id = inputId;
+    input.value = price;
+    input.min = '0';
+    input.max = '1000000';
+    const button = document.createElement('button');
+    button.textContent = 'Speichern';
+    button.addEventListener('click', onSave);
+
+    row.append(name, document.createTextNode(' '), input, document.createTextNode(' '), button);
+    container.appendChild(row);
+}
+
 function showBossMenu(config) {
     const boss = document.getElementById('bossMenu');
     if (boss) {
@@ -275,10 +297,8 @@ function showBossMenu(config) {
         tablePriceList.innerHTML = '';
         if (config.Tables) {
             config.Tables.forEach((table, index) => {
-                const row = document.createElement('div');
-                row.className = 'price-row';
-                row.innerHTML = `<span>${table.label}</span> <input type="number" id="tablePrice_${index + 1}" value="${table.price}" min="0"> <button onclick="updateTablePrice(${index + 1})">Speichern</button>`;
-                tablePriceList.appendChild(row);
+                const tableId = index + 1;
+                appendPriceRow(tablePriceList, table.label, `tablePrice_${tableId}`, table.price, () => updateTablePrice(tableId));
             });
         }
 
@@ -286,10 +306,7 @@ function showBossMenu(config) {
         if (config.Drinks) {
             Object.entries(config.Drinks).forEach(([name, data]) => {
                 const id = safeId(name);
-                const row = document.createElement('div');
-                row.className = 'price-row';
-                row.innerHTML = `<span>${name}</span> <input type="number" id="drinkPrice_${id}" value="${data.price}" min="0"> <button onclick="updateDrinkPrice('${id}', '${name}')">Speichern</button>`;
-                drinkPriceList.appendChild(row);
+                appendPriceRow(drinkPriceList, name, `drinkPrice_${id}`, data.price, () => updateDrinkPrice(id, name));
             });
         }
 
@@ -297,36 +314,11 @@ function showBossMenu(config) {
         if (config.Trays) {
             Object.entries(config.Trays).forEach(([name, data]) => {
                 const id = safeId(name);
-                const row = document.createElement('div');
-                row.className = 'price-row';
-                row.innerHTML = `<span>${name}</span> <input type="number" id="trayPrice_${id}" value="${data.price}" min="0"> <button onclick="updateTrayPrice('${id}', '${name}')">Speichern</button>`;
-                trayPriceList.appendChild(row);
+                appendPriceRow(trayPriceList, name, `trayPrice_${id}`, data.price, () => updateTrayPrice(id, name));
             });
         }
-
-        document.getElementById('keyMenu').value = config.KeyBindings ? config.KeyBindings.menu : 244;
-        document.getElementById('keyBossMenu').value = config.KeyBindings ? config.KeyBindings.bossMenu : 244;
-        document.getElementById('keyBossModifier').value = config.KeyBindings ? config.KeyBindings.bossMenuModifier : 21;
-        document.getElementById('keyToggleHUD').value = config.KeyBindings ? config.KeyBindings.toggleHUD : 20;
-        document.getElementById('keySmoke').value = config.KeyBindings ? config.KeyBindings.smoke : 38;
         boss.style.display = 'block';
         loadStats();
-    }
-}
-
-function updateBossKeyBindings() {
-    const keyMenu = parseInt(document.getElementById('keyMenu').value, 10) || 244;
-    const keyBossMenu = parseInt(document.getElementById('keyBossMenu').value, 10) || 244;
-    const keyBossModifier = parseInt(document.getElementById('keyBossModifier').value, 10) || 21;
-    const keyToggleHUD = parseInt(document.getElementById('keyToggleHUD').value, 10) || 20;
-    const keySmoke = parseInt(document.getElementById('keySmoke').value, 10) || 38;
-
-    if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'updateKeyBindings', menu: keyMenu, bossMenu: keyBossMenu, bossMenuModifier: keyBossModifier, toggleHUD: keyToggleHUD, smoke: keySmoke })
-        }).catch(e => console.error('Fehler bei Tastatur-Update:', e));
     }
 }
 
@@ -340,7 +332,7 @@ function updateBossConfig() {
     const jobGrade = parseInt(document.getElementById('jobGrade').value) || 0;
     
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'updateConfig', jobRequired, jobName, jobGrade })
@@ -358,7 +350,7 @@ function updateServerTime() {
     }
 
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'setServerTime', hour, minute })
@@ -374,7 +366,7 @@ function updateTablePrice(tableId) {
         return;
     }
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'updateTablePrice', tableId, price })
@@ -389,7 +381,7 @@ function setAllTablePrices() {
         return;
     }
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'setAllTablePrices', price })
@@ -405,7 +397,7 @@ function updateDrinkPrice(drinkId, drinkName) {
         return;
     }
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'updateDrinkPrice', drinkName, price })
@@ -421,7 +413,7 @@ function updateTrayPrice(trayId, trayName) {
         return;
     }
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'updateTrayPrice', trayName, price })
@@ -436,7 +428,7 @@ function updateCoalPrice() {
         return;
     }
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'updateCoalPrice', price })
@@ -448,7 +440,7 @@ function loadStats() {
     const statsDiv = document.getElementById('statsContent');
     statsDiv.innerHTML = '<p>Statistiken werden geladen...</p>';
     if (window.fetch) {
-        fetch(`https://shisha_final/bossAction`, {
+        fetch(nuiUrl('bossAction'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'getStats' })

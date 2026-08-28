@@ -29,6 +29,19 @@ Config.Job = "bartender"
 Config.JobRequired = true  -- Nur Bartender-Job kann Shisha nutzen
 Config.JobGradeRequired = 0  -- Mindestens Job-Grad 0 (alle Grade erlaubt)
 Config.UseMultipleJobs = false  -- Nur einzelner Job, keine Mehrfach-Jobs
+Config.AllowedJobs = {
+    {"bartender", 0}
+}
+
+-- Serverseitige Grenzen für Interaktionen und Eingaben
+Config.Security = {
+    interactionDistance = 4.0,
+    smokeCooldownMs = 3000,
+    maxSmokesPerSession = 5,
+    smokeXP = 10,
+    maxPrice = 1000000,
+    purchaseCooldownMs = 500
+}
 
 -- Job-spezifische Funktionen
 Config.JobFunctions = {
@@ -135,20 +148,6 @@ Config.Flavors = {
     ["Zitrone"] = {effect="CitrusBuzz", xp=6},
     ["Kokos"] = {effect="TropicalFade", xp=12}
 }
-
-Config.KeyBindings = {
-    menu = 244,           -- M-Taste zum Öffnen des Shisha-Menüs
-    bossMenu = 244,       -- M-Taste zusammen mit Modifier zum Boss-Menü
-    bossMenuModifier = 21,-- LINKER SHIFT für Boss + M
-    toggleHUD = 20,       -- Z-Taste zum HUD umschalten
-    smoke = 38            -- E-Taste zum Rauchen
-}
-
-Config.MenuKey = Config.KeyBindings.menu
-Config.BossMenuKey = Config.KeyBindings.bossMenu
-Config.BossMenuModifier = Config.KeyBindings.bossMenuModifier
-Config.ToggleHUDKey = Config.KeyBindings.toggleHUD
-Config.SmokeKey = Config.KeyBindings.smoke
 
 Config.HUD = {
     enabled = true,  -- Aktiviert/deaktiviert das HUD komplett
