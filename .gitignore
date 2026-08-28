@@ -1,0 +1,17 @@
+# Local editor and operating-system files
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+
+# Logs, caches, dependencies, and generated output
+*.log
+cache/
+node_modules/
+dist/
+build/
+
